@@ -8,7 +8,6 @@ import logging
 import matplotlib.pyplot as plt
 import pickle
 
-from scipy.special import kv, gamma
 from scipy.stats import norm
 
 class BO:
@@ -44,7 +43,7 @@ class BO:
         Factor by which to reduce bounds. Used only if dynamic_bounds is True.
     """
 
-    def __init__(self, KernelFunction, length_scale, bounds, AcquisitionFunction, acquisition_samples, random_seed=42, minimize=False, log_path=None, dynamic_bounds=False, iterations_between_reducing_bounds=None, first_reduce_bounds=None, reduce_bounds_factor=None):
+    def __init__(self, KernelFunction, length_scale, bounds, AcquisitionFunction, acquisition_samples, random_seed=None, minimize=False, log_path=None, dynamic_bounds=False, iterations_between_reducing_bounds=None, first_reduce_bounds=None, reduce_bounds_factor=None):
         # Initialize class attributes with provided parameters.
         self.Kernel = KernelFunction
         self.length_scale = length_scale
@@ -64,11 +63,12 @@ class BO:
         self.mean = None
         self.variance = None
 
-        self.X_data = np.empty([0, 1])
+        self.X_data = self.X_data = np.empty([0, bounds.shape[0]])
         self.y_data = np.empty([0, 1])
 
         # Set the random seed for reproducibility
-        np.random.seed(self.random_seed)
+        if random_seed is not None:
+            np.random.seed(self.random_seed)
 
         if self.log_path is not None:
             self.CreateLogger()
@@ -112,7 +112,6 @@ class BO:
 
         # Generate random points within the bounds for each dimension
         raw_X = np.array([np.array([np.random.uniform(lower_bound, upper_bound) for (lower_bound, upper_bound) in self.bounds]) for i in range(batch_size)])
-
 
         if self.log_path is not None:
             optimiser_end_time = time.time()  # Record end time for optimization
@@ -438,8 +437,18 @@ class BO:
         K_inv : ndarray, shape (n_samples, n_samples)
             The inverse of the kernel matrix.
         """
+
+        # Standardise the X data
+        X_mean = np.mean(self.X_data, axis=0)
+        X_std = np.std(self.X_data, axis=0)
+
+        # Avoid division by zero for dimensions with no variance
+        X_std[X_std == 0] = 1.0
+
+        X_standardised = (self.X_data - X_mean) / X_std
+
         # Compute the kernel matrix with the jitter term added
-        K = self.Kernel(self.X_data, self.X_data, self.length_scale) + jitter * np.eye(len(self.X_data))
+        K = self.Kernel(X_standardised, X_standardised, self.length_scale) + jitter * np.eye(len(self.X_data))
 
         if self.log_path is not None:
             inverting_start_time = time.time()  # Record start time for inversion
@@ -479,29 +488,46 @@ class BO:
         if K_inv is None:
             K_inv = self.InverseKernel()
 
+
+        # Standardise X_data
+        X_mean = np.mean(self.X_data, axis=0)
+        X_std = np.std(self.X_data, axis=0)
+        X_std[X_std == 0] = 1.0  # Avoid division by zero for zero-variance dimensions
+        X_standardised = (self.X_data - X_mean) / X_std
+
+        # Standardise the candidate_x points
+        candidate_x_standardised = (candidate_x - X_mean) / X_std
+
         # Compute the kernel vector between the training points and candidate points
-        K_star = self.Kernel(self.X_data, candidate_x, self.length_scale)
+        K_star = self.Kernel(X_standardised, candidate_x_standardised, self.length_scale)
 
         # Compute the kernel matrix for the candidate points
-        K_star_star = self.Kernel(candidate_x, candidate_x, self.length_scale) + jitter
+        K_star_star = self.Kernel(candidate_x_standardised, candidate_x_standardised, self.length_scale) + jitter
 
-        # Normalize the y_data for consistency in Gaussian Process calculations
-        if np.max(self.y_data) - np.min(self.y_data) != 0.0:
-            normalized_y_data = 2 * (self.y_data - np.min(self.y_data)) / (np.max(self.y_data) - np.min(self.y_data)) - 1
-        else:
-            normalized_y_data = self.y_data
+
+        # Standardise Y_data
+        y_mean = np.mean(self.y_data)
+        y_std = np.std(self.y_data)
+        if y_std == 0:
+            y_std = 1.0  # Avoid division by zero for constant y_data
+
+        y_standardised = (self.y_data - y_mean) / y_std
 
         if self.minimize is True:
-            normalized_y_data = -normalized_y_data
+            y_standardised = -y_standardised
 
         # Predict the mean of the new point
-        mean = K_star.T.dot(K_inv).dot(normalized_y_data)  
+        mean_standardised = K_star.T.dot(K_inv).dot(y_standardised)  
+        
+        mean = (mean_standardised * y_std) + y_mean
         
         # Compute the full covariance matrix of the prediction
-        full_cov = K_star_star - K_star.T.dot(K_inv).dot(K_star)
+        full_cov_standardised = K_star_star - K_star.T.dot(K_inv).dot(K_star)
 
         # Extract the diagonal elements to get the variances for each new point
-        var = np.diag(full_cov).reshape(len(candidate_x), 1)
+        var_standardised = np.diag(full_cov_standardised).reshape(len(candidate_x), 1)
+
+        var = var_standardised * (y_std**2)
 
         return mean, var
     
@@ -563,7 +589,7 @@ class BO:
             best_index = heapq.nlargest(1, relevant_indices, key=self.y_data.__getitem__)
         else:
         # Find the index of the smallest value in the most recent batch if minimizing
-            best_index = heapq.nsmallest(1, relevant_indices, key=self.y_data.__getitem__)
+                best_index = heapq.nsmallest(1, relevant_indices, key=self.y_data.__getitem__)
         
         # Retrieve the best Y value from the identified index
         best_value = [self.y_data[i] for i in best_index]
@@ -757,21 +783,12 @@ def SausagePlot(object, highlight_recent=0, resolution=1000):
         plt.plot(sample_points, mean, label='mean')
         plt.fill_between(sample_points[:,0], mean[:,0] - 1.96 * np.sqrt(variance[:,0]), mean[:,0] + 1.96 * np.sqrt(variance[:,0]), color = 'blue', alpha=0.2, label = '95% confidence interval')
 
-        # Normalize y_data for plotting
-        if np.max(object.y_data) - np.min(object.y_data) != 0.0:
-            normalized_y_data = 2 * (object.y_data - np.min(object.y_data)) / (np.max(object.y_data) - np.min(object.y_data)) - 1
-        else:
-            normalized_y_data = object.y_data
-
-        if object.minimize is True:
-            normalized_y_data = -normalized_y_data
-
-        # Scatter plot of X_data and normalized y_data
-        plt.scatter(object.X_data, normalized_y_data, s=10)
+        # Scatter plot of X_data and y_data
+        plt.scatter(object.X_data, object.y_data, s=10)
         
         if highlight_recent != 0:
             # Highlight the most recent points
-            plt.scatter(object.X_data[-highlight_recent:], normalized_y_data[-highlight_recent:], s=30, color='red', label=f'most recent {highlight_recent} points')
+            plt.scatter(object.X_data[-highlight_recent:], object.y_data[-highlight_recent:], s=30, color='red', label=f'most recent {highlight_recent} points')
 
         plt.title("Mean/Varance Plot")
         plt.legend()
@@ -820,6 +837,8 @@ def KappaAcquisitionFunctionPlot(object, number_kappas, number_candidate_points,
         # Predict the mean and variance for the sample points
         mean, variance = object.PredictMeanVariance(sample_points)
 
+        x_values = []
+
         # Iterate through each kappa value to calculate the acquisition function
         for i in range(number_kappas):
             candidate_X = np.empty([number_candidate_points, len(object.bounds)])  # Initialize array to store candidate X points
@@ -840,6 +859,8 @@ def KappaAcquisitionFunctionPlot(object, number_kappas, number_candidate_points,
             # Choose the x value which corresponds to the largest candidate y
             max_index = np.argmax(candidate_y)
 
+            x_values.append(candidate_X[max_index])
+
             # Plot the point with the maximum acquisition value
             plt.scatter(candidate_X[max_index], candidate_y[max_index], s=50, color=f'C{i}')
             
@@ -853,10 +874,11 @@ def KappaAcquisitionFunctionPlot(object, number_kappas, number_candidate_points,
         plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
         plt.show()
 
+        return np.array(x_values)
     else:
         print('Function requires a one dimensional optimization problem.')
 
-def PlotData(object):
+def PlotData(object, legend=False):
     """
     Plot the objective function values against simulation numbers.
 
@@ -878,7 +900,8 @@ def PlotData(object):
     plt.title('Objective function value against simulation number')
     plt.xlabel('Simulation number')
     plt.ylabel('Objective function value')
-    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    if legend:
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
     plt.show()
 
 def PlotParameterEvolution(object):
@@ -958,75 +981,103 @@ def PlotParameterCorrelation(object):
                                             
 # ==============----------------- -- -- -- - - Kernels - - -- -- -- -------------------================ #         
 
-def RBF_Kernel(X1, X2, length_scale):
+def RBF_Kernel(X1, X2, length_scales):
     """
-    Radial Basis Function (RBF) kernel.
+    Compute the RBF kernel between two sets of points.
 
-    Computes the RBF kernel between two sets of points, which is commonly 
-    used in Gaussian Process regression for measuring similarity between points.
+    Parameters:
+    - X: array-like, shape (n_X, d)
+        The first set of input points.
+    - Y: array-like, shape (n_Y, d)
+        The second set of input points.
+    - length_scales: float or array-like, shape (d,) or shape (1,)
+        The length scale for each dimension or a single length scale for all dimensions.
 
-    Parameters
-    ----------
-    X1 : np.ndarray
-        First set of points.
-    X2 : np.ndarray
-        Second set of points.
-    length_scale : float
-        The length scale parameter which controls the smoothness of the function.
-
-    Returns
-    -------
-    np.ndarray
-        The kernel matrix representing the pairwise similarities between points in X1 and X2.
+    Returns:
+    - K: array, shape (n_X, n_Y)
+        The RBF kernel matrix.
     """
-    # Calculate the squared Euclidean distance between each pair of points in X1 and X2
-    sqdist = np.sum(X1**2, 1).reshape(-1, 1) + np.sum(X2**2, 1) - 2 * np.dot(X1, X2.T)
+    # Check if length_scales is a single float or an array
+    if np.isscalar(length_scales):
+        length_scales = np.full((1, X1.shape[1]), length_scales)  # Convert to array for broadcasting
+    else:
+        length_scales = np.array(length_scales).reshape(1, -1)  # Shape (1, d)
+        if np.shape(length_scales)[1] != np.shape(X1)[1]:
+            raise ValueError(f'Length scale array incorrect length. Should have {np.shape(X1)[1]} elements but has {np.shape(length_scales)[1]}.')
 
-    # Compute the RBF kernel matrix
-    return np.exp(-0.5 / length_scale**2 * sqdist)
+    # Scale X and Y by the length scales
+    X1_scaled = X1 / length_scales  # Shape (n_X, d)
+    X2_scaled = X2 / length_scales  # Shape (n_Y, d)
+
+    # Compute the squared distance
+    diff = X1_scaled[:, np.newaxis, :] - X2_scaled[np.newaxis, :, :]  # Shape (n_X, n_Y, d)
+    squared_diff = np.sum(diff ** 2, axis=2)  # Sum over the d dimension
+
+    # Calculate the RBF kernel matrix
+    K = np.exp(-0.5 * squared_diff)
+
+    return K
 
 
-def MaternKernel(X1, X2, length_scale, nu=1.0):
+def MaternKernel(X1, X2, length_scales, nu=1.0):
     """
     Matern kernel function.
-
-    The Matern kernel is a popular kernel function in Gaussian Processes, 
-    parameterized by a smoothness parameter nu that controls the roughness of the function.
 
     Parameters
     ----------
     X1, X2 : np.ndarray
-        Input points, can be scalars or numpy arrays.
-    length_scale : float
-        The length scale parameter.
+        Input points, shape (n_X, d) and (n_Y, d) respectively.
+    length_scales : float or array-like, shape (d,) or shape (1,)
+        The length scale parameter for each dimension or a single length scale for all dimensions.
     nu : float, optional
         Controls the smoothness of the function. Common values are 0.5, 1.5, and 2.5.
 
     Returns
     -------
     np.ndarray
-        Kernel values between X1 and X2.
+        Kernel values between X1 and X2, shape (n_X, n_Y).
     """
-    # Ensure inputs are numpy arrays
-    X1 = np.atleast_1d(X1)
-    X2 = np.atleast_1d(X2)
-    
-    # Compute the pairwise Euclidean distances between X1 and X2
-    pairwise_dists = np.sqrt(np.sum((X1[:, np.newaxis, :] - X2[np.newaxis, :, :]) ** 2, axis=-1))
+    from scipy.special import kv, gamma
 
-    # Compute the scaled distances based on the length scale and nu parameter
-    scaled_dists = np.sqrt(2 * nu) * pairwise_dists / length_scale
+    # Ensure length_scales is a numpy array
+    if np.isscalar(length_scales):
+        length_scales = np.full(X1.shape[1], length_scales)  # Shape (d,)
+    else:
+        length_scales = np.array(length_scales)
+        if length_scales.shape[0] != X1.shape[1]:
+            raise ValueError(f'Length scale array incorrect length. Should have {X1.shape[1]} elements but has {length_scales.shape[0]}.')
+
+    # Scale X and Y by the length scales
+    X1_scaled = X1 / length_scales  # Shape (n_X, d)
+    X2_scaled = X2 / length_scales  # Shape (n_Y, d)
+
+    diff = X1_scaled[:, np.newaxis, :] - X2_scaled[np.newaxis, :, :]  # Shape (n_X, n_Y, d)
+    squared_rooted_diff = np.sqrt(np.sum(diff ** 2, axis=2))  # Sum over the d dimension
+
+    # Scale distances based on the length scales
+    scaled_dists = np.sqrt(2 * nu) * squared_rooted_diff  # Shape (n_X, n_Y)
+
+    # Initialize kernel values (adjusted to match the shape of X1 and X2)
+    kernel_values = np.ones((X1.shape[0], X2.shape[0]))  # Shape (n_X, n_Y)
+
+    print(np.shape(kernel_values))
 
     # Compute the Matern kernel values
     if nu == 0.5:
-        # Special case for nu = 0.5, equivalent to the exponential kernel
-        kernel_values = np.exp(-scaled_dists)
+        kernel_values = np.exp(-scaled_dists)  # For nu = 0.5
     else:
-        # General case for other values of nu
-        kernel_values = (2**(1.0 - nu) / gamma(nu)) * (scaled_dists**nu) * kv(nu, scaled_dists)
-        kernel_values[np.isnan(kernel_values)] = 1.0  # Handle division by zero by setting NaNs to 1.0
+        # Compute the kernel component
+        kernel_component = (2**(1.0 - nu) / gamma(nu)) * (scaled_dists**nu) * kv(nu, scaled_dists)
+
+        # Handle NaN values
+        kernel_component[np.isnan(kernel_component)] = 1.0  # Handles division by zero
+        kernel_component[scaled_dists == 0] = 1.0  # K(0) = 1 for all nu
+
+        # Use assignment rather than multiplication
+        kernel_values = kernel_component  # Directly assign the computed kernel values
 
     return kernel_values
+
 
 # ==========p====----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
                                             
@@ -1054,7 +1105,8 @@ def UpperConfidenceBound(mean, standard_deviation, kappa=0.1):
         The acquisition values used to guide the selection of the next sample point.
     """
     # Generate a small random noise to avoid deterministic behavior
-    random_numbers = 0.01 * (np.random.rand(len(mean)).reshape(len(mean), 1))
+    random_numbers = 0.05 * (np.random.rand(len(mean)).reshape(len(mean), 1))
+    random_numbers = random_numbers * np.max(standard_deviation)
 
     # Compute the UCB acquisition function
     ucb = mean + kappa * (standard_deviation + random_numbers)
