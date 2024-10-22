@@ -60,9 +60,6 @@ class BO:
         self.iteration_number = 0
         self.iterations_array = np.empty([0, 1])
 
-        self.mean = None
-        self.variance = None
-
         self.X_data = self.X_data = np.empty([0, bounds.shape[0]])
         self.y_data = np.empty([0, 1])
 
@@ -154,17 +151,17 @@ class BO:
             candidate_x = np.random.uniform(self.bounds[:, 0], self.bounds[:, 1], size=(self.acquisition_samples, self.bounds.shape[0]))
 
             # Predict the mean and standard deviation at each of these points
-            self.mean, self.variance = self.PredictMeanVariance(candidate_x, K_inv=K_inv)
+            mean, variance = self.PredictMeanVariance(candidate_x, K_inv=K_inv)
 
             # Calculate the acquisition value for each candidate point
             if kappa == 'default':
-                candidate_y = self.AcquisitionFunction(self.mean, np.sqrt(self.variance))
+                candidate_y = self.AcquisitionFunction(mean, np.sqrt(variance))
             else:
-                candidate_y = self.AcquisitionFunction(self.mean, np.sqrt(self.variance), kappa)
+                candidate_y = self.AcquisitionFunction(mean, np.sqrt(variance), kappa)
 
             # Choose the X value which corresponds to the largest acquisition value
-            self.max_index = np.argmax(candidate_y)
-            next_X = np.array([candidate_x[self.max_index]])
+            max_index = np.argmax(candidate_y)
+            next_X = np.array([candidate_x[max_index]])
 
         return next_X
     
@@ -222,11 +219,15 @@ class BO:
                             raw_X[i] = self.GetNextX(K_inv=K_inv)[0]
                         else:
                             raw_X[i] = self.GetNextX(kappa, K_inv=K_inv)[0]
+                if self.log_path is not None:
+                    self.logger.info(f'Got the batch of X values.')
 
             if sub_batch_size:
                 raw_X = np.empty((batch_size,len(self.bounds)))  # Initialize the list to store the batch of X values
 
                 for i in range(int(np.ceil(batch_size / sub_batch_size))):
+                    if self.log_path is not None: 
+                        self.logger.info(f'Getting X values for sub-batch {i}.')
                     sub_raw_X = np.empty((sub_batch_size, len(self.bounds)))
                     sub_raw_y = np.empty([sub_batch_size, 1])
                     K_inv = self.InverseKernel()
@@ -243,19 +244,18 @@ class BO:
 
                         raw_X[j + sub_batch_size * i] = sub_raw_X[j]
 
-                        normalized_y = self.mean[self.max_index]
+                        sub_raw_y = self.PredictMeanVariance(np.array(sub_raw_X), K_inv=K_inv)[0]
 
                         if self.minimize is True:
-                            normalized_y = -normalized_y
-
-                        if np.max(self.y_data) - np.min(self.y_data) != 0.0:
-                            sub_raw_y[j] = (normalized_y + 1) / 2 * (np.max(self.y_data) - np.min(self.y_data)) + np.min(self.y_data)
-                        else: 
-                            sub_raw_y[j] = normalized_y
+                            sub_raw_y = -sub_raw_y
 
                     # Concatenate sub-batch data to the existing X_data and y_data arrays
                     self.X_data = np.vstack([self.X_data, sub_raw_X])
                     self.y_data = np.vstack([self.y_data, sub_raw_y])
+
+                    if self.log_path is not None:
+                        self.logger.info(f'Got X values for sub-batch {i}.')
+                        self.logger.info(f'')
 
                 # Remove the initial empty entries
                 self.X_data = self.X_data[:-batch_size]
@@ -458,7 +458,7 @@ class BO:
 
         if self.log_path is not None:
             inverting_end_time = time.time()  # Record end time for inversion
-            self.logger.info(f'It took {inverting_end_time-inverting_start_time} to invert the kernel.')
+            self.logger.info(f'It took {(inverting_end_time-inverting_start_time) / 60} minutes to invert the kernel.')
 
         return K_inv
 
@@ -503,7 +503,6 @@ class BO:
 
         # Compute the kernel matrix for the candidate points
         K_star_star = self.Kernel(candidate_x_standardised, candidate_x_standardised, self.length_scale) + jitter
-
 
         # Standardise Y_data
         y_mean = np.mean(self.y_data)
