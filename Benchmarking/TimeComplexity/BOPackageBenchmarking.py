@@ -448,7 +448,12 @@ class BO:
         X_standardised = (self.X_data - X_mean) / X_std
 
         # Compute the kernel matrix with the jitter term added
+        if self.log_path is not None:
+            kernel_start_time = time.time()
         K = self.Kernel(X_standardised, X_standardised, self.length_scale) + jitter * np.eye(len(self.X_data))
+        if self.log_path is not None:
+            kernel_end_time = time.time()
+            self.logger.info(f'It took {(kernel_end_time-kernel_start_time) / 60} minutes to calculate the kernel.')
 
         if self.log_path is not None:
             inverting_start_time = time.time()  # Record start time for inversion
@@ -488,7 +493,8 @@ class BO:
         if K_inv is None:
             K_inv = self.InverseKernel()
 
-
+        if self.log_path is not None:
+            standardisation_start_time = time.time()
         # Standardise X_data
         X_mean = np.mean(self.X_data, axis=0)
         X_std = np.std(self.X_data, axis=0)
@@ -498,11 +504,27 @@ class BO:
         # Standardise the candidate_x points
         candidate_x_standardised = (candidate_x - X_mean) / X_std
 
+        if self.log_path is not None:
+            standardisation_end_time = time.time()
+            self.logger.info(f'')
+            self.logger.info(f'It took {(standardisation_end_time-standardisation_start_time ) / 60} minutes to standardise X.')
+    
         # Compute the kernel vector between the training points and candidate points
+        if self.log_path is not None:
+            k_star_start_time = time.time()
         K_star = self.Kernel(X_standardised, candidate_x_standardised, self.length_scale)
+        if self.log_path is not None:
+            k_star_end_time = time.time()
+            self.logger.info(f'It took {(k_star_end_time-k_star_start_time) / 60} minutes to calculate K_star.')
 
         # Compute the kernel matrix for the candidate points
+        if self.log_path is not None:
+            k_star_star_start_time = time.time()
         K_star_star = self.Kernel(candidate_x_standardised, candidate_x_standardised, self.length_scale) + jitter
+        if self.log_path is not None:
+            k_star_star_end_time = time.time()
+            self.logger.info(f'It took {(k_star_star_end_time-k_star_star_start_time) / 60} minutes to calculate K_star_star.')
+
 
         # Standardise Y_data
         y_mean = np.mean(self.y_data)
@@ -516,8 +538,13 @@ class BO:
             y_standardised = -y_standardised
 
         # Predict the mean of the new point
+        if self.log_path is not None:
+            mean_start_time = time.time()
         mean_standardised = K_star.T.dot(K_inv).dot(y_standardised)  
-        
+        if self.log_path is not None:
+            mean_end_time = time.time()
+            self.logger.info(f'It took {(mean_end_time-mean_start_time) / 60} minutes to calculate the mean and vairance.')
+
         mean = (mean_standardised * y_std) + y_mean
         
         # Compute the full covariance matrix of the prediction
