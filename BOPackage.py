@@ -12,8 +12,8 @@ from scipy.stats import norm
 
 class BO:
     """
-    A class for Bayesian Optimization (BO) to find the optimal input values that maximize 
-    or minimize an objective function.
+    A class for Bayesian Optimization (BO) to find the optimal input values that maximise 
+    or minimise an objective function.
 
     Parameters
     ----------
@@ -29,8 +29,8 @@ class BO:
         Number of candidate points to sample for the acquisition function.
     random_seed : int, optional
         Seed for random number generation to ensure reproducibility.
-    minimize : bool, optional
-        If True, the objective is to minimize the function instead of maximizing it.
+    minimise : bool, optional
+        If True, the objective is to minimise the function instead of maximizing it.
     log_path : str, optional
         Path to the log file for logging the optimization process. No logging is done if log_path is None.
     dynamic_bounds : bool, optional
@@ -43,8 +43,8 @@ class BO:
         Factor by which to reduce bounds. Used only if dynamic_bounds is True.
     """
 
-    def __init__(self, KernelFunction, length_scale, bounds, AcquisitionFunction, acquisition_samples, random_seed=None, minimize=False, log_path=None, dynamic_bounds=False, iterations_between_reducing_bounds=None, first_reduce_bounds=None, reduce_bounds_factor=None):
-        # Initialize class attributes with provided parameters.
+    def __init__(self, KernelFunction, length_scale, bounds, AcquisitionFunction, acquisition_samples, random_seed=None, minimise=False, log_path=None, dynamic_bounds=False, iterations_between_reducing_bounds=None, first_reduce_bounds=None, reduce_bounds_factor=None):
+        # initialise class attributes with provided parameters.
         self.Kernel = KernelFunction
         self.length_scale = length_scale
         self.bounds = bounds
@@ -53,7 +53,7 @@ class BO:
         self.acquisition_samples = acquisition_samples
 
         self.random_seed = random_seed
-        self.minimize = minimize
+        self.minimise = minimise
 
         self.log_path = log_path
 
@@ -205,7 +205,7 @@ class BO:
                 self.logger.info('')
 
             if sub_batch_size is None:
-                raw_X = np.empty((batch_size,len(self.bounds)))  # Initialize the list to store the batch of X values
+                raw_X = np.empty((batch_size,len(self.bounds)))  # initialise the list to store the batch of X values
                 K_inv = self.InverseKernel()
 
                 for i in range(batch_size):
@@ -223,7 +223,7 @@ class BO:
                     self.logger.info(f'Got the batch of X values.')
 
             if sub_batch_size:
-                raw_X = np.empty((batch_size,len(self.bounds)))  # Initialize the list to store the batch of X values
+                raw_X = np.empty((batch_size,len(self.bounds)))  # initialise the list to store the batch of X values
 
                 for i in range(int(np.ceil(batch_size / sub_batch_size))):
                     if self.log_path is not None: 
@@ -244,10 +244,12 @@ class BO:
 
                         raw_X[j + sub_batch_size * i] = sub_raw_X[j]
 
-                        sub_raw_y = self.PredictMeanVariance(np.array(sub_raw_X), K_inv=K_inv)[0]
+                    normalised_sub_raw_y = self.PredictMeanVariance(np.array(sub_raw_X), K_inv=K_inv)[0]
 
-                        if self.minimize is True:
-                            sub_raw_y = -sub_raw_y
+                    sub_raw_y = np.min(self.y_data) + ((normalised_sub_raw_y + 1) * (np.max(self.y_data) - np.min(self.y_data)) / 2)
+
+                    if self.minimise is True:
+                        sub_raw_y = -sub_raw_y
 
                     # Concatenate sub-batch data to the existing X_data and y_data arrays
                     self.X_data = np.vstack([self.X_data, sub_raw_X])
@@ -260,7 +262,6 @@ class BO:
                 # Remove the initial empty entries
                 self.X_data = self.X_data[:-batch_size]
                 self.y_data = self.y_data[:-batch_size]
-
 
             if self.log_path is not None:
                 optimiser_end_time = time.time()  # Record end time for optimization
@@ -437,18 +438,8 @@ class BO:
         K_inv : ndarray, shape (n_samples, n_samples)
             The inverse of the kernel matrix.
         """
-
-        # Standardise the X data
-        X_mean = np.mean(self.X_data, axis=0)
-        X_std = np.std(self.X_data, axis=0)
-
-        # Avoid division by zero for dimensions with no variance
-        X_std[X_std == 0] = 1.0
-
-        X_standardised = (self.X_data - X_mean) / X_std
-
         # Compute the kernel matrix with the jitter term added
-        K = self.Kernel(X_standardised, X_standardised, self.length_scale) + jitter * np.eye(len(self.X_data))
+        K = self.Kernel(self.X_data, self.X_data, self.length_scale) + jitter * np.eye(len(self.X_data))
 
         if self.log_path is not None:
             inverting_start_time = time.time()  # Record start time for inversion
@@ -462,7 +453,7 @@ class BO:
 
         return K_inv
 
-    def PredictMeanVariance(self, candidate_x, K_inv=None, jitter=1e-7):
+    def PredictMeanVariance(self, candidate_x, K_inv=None, jitter=1e-7, normalised=True):
         """
         Predict the mean and variance of the objective function using a Gaussian Process.
 
@@ -488,47 +479,41 @@ class BO:
         if K_inv is None:
             K_inv = self.InverseKernel()
 
-
-        # Standardise X_data
-        X_mean = np.mean(self.X_data, axis=0)
-        X_std = np.std(self.X_data, axis=0)
-        X_std[X_std == 0] = 1.0  # Avoid division by zero for zero-variance dimensions
-        X_standardised = (self.X_data - X_mean) / X_std
-
-        # Standardise the candidate_x points
-        candidate_x_standardised = (candidate_x - X_mean) / X_std
-
         # Compute the kernel vector between the training points and candidate points
-        K_star = self.Kernel(X_standardised, candidate_x_standardised, self.length_scale)
+        K_star = self.Kernel(self.X_data, candidate_x, self.length_scale)
 
         # Compute the kernel matrix for the candidate points
-        K_star_star = self.Kernel(candidate_x_standardised, candidate_x_standardised, self.length_scale) + jitter
+        K_star_star = self.Kernel(candidate_x, candidate_x, self.length_scale) + jitter
 
-        # Standardise Y_data
-        y_mean = np.mean(self.y_data)
-        y_std = np.std(self.y_data)
-        if y_std == 0:
-            y_std = 1.0  # Avoid division by zero for constant y_data
+        # normalise the y_data for consistency in Gaussian Process calculations
+        if np.max(self.y_data) - np.min(self.y_data) != 0.0:
+            normalised_y_data = 2 * (self.y_data - np.min(self.y_data)) / (np.max(self.y_data) - np.min(self.y_data)) - 1
+        else:
+            normalised_y_data = self.y_data
 
-        y_standardised = (self.y_data - y_mean) / y_std
-
-        if self.minimize is True:
-            y_standardised = -y_standardised
+        if self.minimise is True:
+            normalised_y_data = -normalised_y_data
 
         # Predict the mean of the new point
-        mean_standardised = K_star.T.dot(K_inv).dot(y_standardised)  
-        
-        mean = (mean_standardised * y_std) + y_mean
-        
+        mean = K_star.T.dot(K_inv).dot(normalised_y_data)  
+
         # Compute the full covariance matrix of the prediction
-        full_cov_standardised = K_star_star - K_star.T.dot(K_inv).dot(K_star)
+        full_cov = K_star_star - K_star.T.dot(K_inv).dot(K_star)
 
         # Extract the diagonal elements to get the variances for each new point
-        var_standardised = np.diag(full_cov_standardised).reshape(len(candidate_x), 1)
+        var = np.diag(full_cov).reshape(len(candidate_x), 1)
 
-        var = var_standardised * (y_std**2)
+        if normalised==True:
+            return mean, var
+        
+        if normalised==False:
+            y_min = np.min(self.y_data)
+            y_max = np.max(self.y_data)
+            actual_mean = y_min + (y_max - y_min) * (mean + 1) / 2
 
-        return mean, var
+            var_scaling_factor = ((y_max - y_min) / 2) ** 2
+            actual_var = var * var_scaling_factor
+            return actual_mean, actual_var
     
     def CalculateKappa(self, batch_size, current_simulation_number, max_kappa, min_kappa):
         """
@@ -572,18 +557,18 @@ class BO:
 
     def CheckImprovement(self):
         """
-        Check if the optimizer has made an improvement.
+        Check if the optimiser has made an improvement.
 
         This method compares the best value from the most recent batch of iterations 
         with the current best value recorded. If an improvement is found (i.e., a new 
-        best value is discovered), it resets the counter that tracks how long the optimizer 
+        best value is discovered), it resets the counter that tracks how long the optimiser 
         has been without improvement. If no improvement is observed, the counter is incremented 
         to potentially trigger bounds reduction.
         """
         # Define the range of indices for the most recent batch of data
         relevant_indices = range(max(len(self.y_data) - self.batch_size, 0), len(self.y_data))
         
-        if self.minimize is False:
+        if self.minimise is False:
             # Find the index of the largest value in the most recent batch if maximizing
             best_index = heapq.nlargest(1, relevant_indices, key=self.y_data.__getitem__)
         else:
@@ -594,7 +579,7 @@ class BO:
         best_value = [self.y_data[i] for i in best_index]
 
         # Check if the best value from the recent batch improves upon the current best value
-        if (self.minimize is False and best_value[0] > self.current_best_value) or (self.minimize is True and best_value[0] < self.current_best_value):
+        if (self.minimise is False and best_value[0] > self.current_best_value) or (self.minimise is True and best_value[0] < self.current_best_value):
             # Improvement found, reset the no improvement flag and counter
             self.no_improvement_flag = 0  
             self.no_improvement_counter = 0 
@@ -612,7 +597,7 @@ class BO:
         """
         Reduce the search bounds if no improvement is found.
 
-        This method reduces the search bounds if the optimizer has not found a better 
+        This method reduces the search bounds if the optimiser has not found a better 
         point for a specified number of iterations and if the current iteration number 
         exceeds a certain threshold. It proportionally reduces the bounds around the best 
         observed point and scales the length scale used in the kernel function.
@@ -629,7 +614,7 @@ class BO:
             # Find the best observed point to center the new bounds
             best_point = self.X_data[self.BestData()[0][0]]
 
-            # Initialize arrays for new bounds and ranges
+            # initialise arrays for new bounds and ranges
             new_bounds = np.empty_like(self.bounds, dtype=float)
             new_range = np.empty_like(best_point, dtype=float)
 
@@ -670,7 +655,7 @@ class BO:
         tuple : (ndarray, ndarray)
             A tuple containing the sorted indices and corresponding values of the best data points.
         """
-        if self.minimize is False:
+        if self.minimise is False:
             # Find the indices of the best y values
             best_indices = heapq.nlargest(number_indices, range(len(self.y_data)), key=self.y_data.__getitem__)
         else:
@@ -756,14 +741,14 @@ class BO:
                                             
 # ==============----------------- -- -- - - - Plotting - - - -- -- -------------------================ #   
 
-def SausagePlot(object, highlight_recent=0, resolution=1000):
+def SausagePlot(object, highlight_recent=0, resolution=1000, normalised=False):
     """
-    Generate a "sausage plot" to visualize the mean and variance of a one-dimensional function.
+    Generate a "sausage plot" to visualise the mean and variance of a one-dimensional function.
 
     Parameters
     ----------
     object : BO
-        The Bayesian Optimization object to be visualized.
+        The Bayesian Optimization object to be visualised.
     highlight_recent : int, optional
         The number of most recent points to highlight on the plot.
     resolution : int, optional
@@ -778,32 +763,65 @@ def SausagePlot(object, highlight_recent=0, resolution=1000):
         # Predict mean and variance at the sample points
         mean, variance = object.PredictMeanVariance(sample_points)
 
-        # Plot the mean and the confidence interval
-        plt.plot(sample_points, mean, label='mean')
-        plt.fill_between(sample_points[:,0], mean[:,0] - 1.96 * np.sqrt(variance[:,0]), mean[:,0] + 1.96 * np.sqrt(variance[:,0]), color = 'blue', alpha=0.2, label = '95% confidence interval')
+        y_min = np.min(object.y_data)
+        y_max = np.max(object.y_data)
+        actual_mean = y_min + (y_max - y_min) * (mean + 1) / 2
 
-        # Scatter plot of X_data and y_data
-        plt.scatter(object.X_data, object.y_data, s=10)
-        
-        if highlight_recent != 0:
-            # Highlight the most recent points
-            plt.scatter(object.X_data[-highlight_recent:], object.y_data[-highlight_recent:], s=30, color='red', label=f'most recent {highlight_recent} points')
+        variance_scaling_factor = ((y_max - y_min) / 2) ** 2
+        actual_variance = variance * variance_scaling_factor
 
-        plt.title("Mean/Varance Plot")
-        plt.legend()
-        plt.show()
+        if normalised==False:
+            # Plot the mean and the confidence interval
+            plt.plot(sample_points, actual_mean, label='mean')
+            plt.fill_between(sample_points[:,0], actual_mean[:,0] - 1.96 * np.sqrt(actual_variance[:,0]), actual_mean[:,0] + 1.96 * np.sqrt(actual_variance[:,0]), color = 'blue', alpha=0.2, label = '95% confidence interval')
+
+            # Scatter plot of X_data and y_data
+            plt.scatter(object.X_data, object.y_data, s=10)
+            
+            if highlight_recent != 0:
+                # Highlight the most recent points
+                plt.scatter(object.X_data[-highlight_recent:], object.y_data[-highlight_recent:], s=30, color='red', label=f'most recent {highlight_recent} points')
+
+            plt.title("Mean/Varance Plot")
+            plt.legend()
+            plt.show()
+
+        if normalised==True:
+            # normalise the y_data for consistency in Gaussian Process calculations
+            if np.max(object.y_data) - np.min(object.y_data) != 0.0:
+                normalised_y_data = 2 * (object.y_data - np.min(object.y_data)) / (np.max(object.y_data) - np.min(object.y_data)) - 1
+            else:
+                normalised_y_data = object.y_data
+
+            if object.minimise is True:
+                normalised_y_data = -normalised_y_data
+            
+            # Plot the mean and the confidence interval
+            plt.plot(sample_points, mean, label='mean')
+            plt.fill_between(sample_points[:,0], mean[:,0] - 1.96 * np.sqrt(variance[:,0]), mean[:,0] + 1.96 * np.sqrt(variance[:,0]), color = 'blue', alpha=0.2, label = '95% confidence interval')
+
+            # Scatter plot of X_data and y_data
+            plt.scatter(object.X_data, normalised_y_data, s=10)
+            
+            if highlight_recent != 0:
+                # Highlight the most recent points
+                plt.scatter(object.X_data[-highlight_recent:], normalised_y_data[-highlight_recent:], s=30, color='red', label=f'most recent {highlight_recent} points')
+
+            plt.title("Mean/Varance Plot")
+            plt.legend()
+            plt.show()
 
     else:
         print('Can only produce sausage plots of one dimensional functions.')
 
 def KappaAcquisitionFunctionPlot(object, number_kappas, number_candidate_points, max_kappa, min_kappa, resolution=1000):
     """
-    Visualize the acquisition function for a range of kappa values.
+    visualise the acquisition function for a range of kappa values.
 
     This function calculates and plots the acquisition function for a specified number of 
     kappa values. It generates candidate X points, calculates the corresponding Y values, 
     and identifies the maximum Y value for each kappa. The results are plotted to help 
-    visualize the acquisition function and its dependency on the kappa value.
+    visualise the acquisition function and its dependency on the kappa value.
 
     Parameters
     ----------
@@ -824,7 +842,7 @@ def KappaAcquisitionFunctionPlot(object, number_kappas, number_candidate_points,
 
     # Function requires a one-dimensional optimization problem
     if len(object.bounds) == 1:
-        kappas = np.empty([number_kappas, 1])  # Initialize an empty array to store kappa values
+        kappas = np.empty([number_kappas, 1])  # initialise an empty array to store kappa values
         
         # Calculate kappa values for the specified range
         for i in range(number_kappas):
@@ -840,8 +858,8 @@ def KappaAcquisitionFunctionPlot(object, number_kappas, number_candidate_points,
 
         # Iterate through each kappa value to calculate the acquisition function
         for i in range(number_kappas):
-            candidate_X = np.empty([number_candidate_points, len(object.bounds)])  # Initialize array to store candidate X points
-            candidate_y = np.empty([number_candidate_points, 1])  # Initialize array to store corresponding y values
+            candidate_X = np.empty([number_candidate_points, len(object.bounds)])  # initialise array to store candidate X points
+            candidate_y = np.empty([number_candidate_points, 1])  # initialise array to store corresponding y values
             
             # Generate candidate points and calculate their acquisition values
             for j in range(number_candidate_points):
@@ -908,7 +926,7 @@ def PlotParameterEvolution(object):
     Plot the evolution of optimization parameters over simulation runs.
 
     This function generates a scatter plot for each optimization parameter
-    to visualize how each parameter value evolves over the course of simulations.
+    to visualise how each parameter value evolves over the course of simulations.
 
     Parameters
     ----------
@@ -942,7 +960,7 @@ def PlotParameterCorrelation(object):
     """
     Plot the correlation between each optimization parameter and the objective value.
 
-    This function creates scatter plots to visualize the relationship between the 
+    This function creates scatter plots to visualise the relationship between the 
     first optimization parameter (X0) and every other parameter, colored by the 
     corresponding objective values.
 
@@ -1056,7 +1074,7 @@ def MaternKernel(X1, X2, length_scales, nu=1.0):
     # Scale distances based on the length scales
     scaled_dists = np.sqrt(2 * nu) * squared_rooted_diff  # Shape (n_X, n_Y)
 
-    # Initialize kernel values (adjusted to match the shape of X1 and X2)
+    # initialise kernel values (adjusted to match the shape of X1 and X2)
     kernel_values = np.ones((X1.shape[0], X2.shape[0]))  # Shape (n_X, n_Y)
 
     print(np.shape(kernel_values))
@@ -1262,12 +1280,12 @@ def BayesianExpectedLoss(mean, standard_deviation, best_observed=1.0, kappa=0.01
                                             
 # ==============----------------- -- -- - Load/Save Object - -- -- -------------------================ #    
 
-def SaveOptimisaer(object, file_path):
+def SaveOptimiser(object, file_path):
     """
     Save the Bayesian Optimization object to a file using pickle.
 
-    This function serializes the given Bayesian Optimization object and saves it to 
-    a specified file path. This allows for the persistence of the optimizer's state,
+    This function serialises the given Bayesian Optimization object and saves it to 
+    a specified file path. This allows for the persistence of the optimiser's state,
     enabling it to be loaded and used later.
 
     Parameters
@@ -1279,14 +1297,14 @@ def SaveOptimisaer(object, file_path):
     """
     # Open the specified file in write-binary mode
     with open(file_path, 'wb') as file:
-        # Serialize the object using pickle and write it to the file
+        # Serialise the object using pickle and write it to the file
         pickle.dump(object, file)
 
 def LoadOptimiser(file_path):
     """
     Load a Bayesian Optimization object from a file using pickle.
 
-    This function deserializes a Bayesian Optimization object from a specified file path,
+    This function deserialises a Bayesian Optimization object from a specified file path,
     allowing for the continuation of a previously saved optimization process.
 
     Parameters
@@ -1301,7 +1319,7 @@ def LoadOptimiser(file_path):
     """
     # Open the specified file in read-binary mode
     with open(file_path, 'rb') as file:
-        # Deserialize the object using pickle and return it
+        # Deserialise the object using pickle and return it
         object = pickle.load(file)
 
     return object
