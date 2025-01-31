@@ -489,7 +489,7 @@ class BO:
         if np.max(self.y_data) - np.min(self.y_data) != 0.0:
             normalised_y_data = 2 * (self.y_data - np.min(self.y_data)) / (np.max(self.y_data) - np.min(self.y_data)) - 1
         else:
-            normalised_y_data = self.y_data
+            normalised_y_data = np.zeros_like(self.y_data)
 
         if self.minimise is True:
             normalised_y_data = -normalised_y_data
@@ -511,7 +511,10 @@ class BO:
             y_max = np.max(self.y_data)
             actual_mean = y_min + (y_max - y_min) * (mean + 1) / 2
 
-            var_scaling_factor = ((y_max - y_min) / 2) ** 2
+            if np.max(self.y_data) - np.min(self.y_data) != 0.0:
+                var_scaling_factor = ((y_max - y_min) / 2) ** 2
+            else:
+                var_scaling_factor = abs(y_max)
             actual_var = var * var_scaling_factor
             return actual_mean, actual_var
     
