@@ -46,8 +46,9 @@ class BO:
         Factor by which to reduce bounds. Used only if dynamic_bounds is True.
     """
 
-    def __init__(self, KernelFunction, length_scale, bounds, AcquisitionFunction, acquisition_samples, random_seed=None, minimise=False, log_path=None, dynamic_bounds=False, iterations_between_reducing_bounds=None, first_reduce_bounds=None, reduce_bounds_factor=None):
+    def __init__(self, PriorMeanFunction, KernelFunction, length_scale, bounds, AcquisitionFunction, acquisition_samples, random_seed=None, minimise=False, log_path=None, dynamic_bounds=False, iterations_between_reducing_bounds=None, first_reduce_bounds=None, reduce_bounds_factor=None):
         # initialise class attributes with provided parameters.
+        self.PriorMean = PriorMeanFunction
         self.Kernel = KernelFunction
         self.length_scale = length_scale
         self.bounds = bounds
@@ -394,6 +395,8 @@ class BO:
             K_inv = tf.convert_to_tensor(K_inv, dtype=tf.float64)
             candidate_x = tf.convert_to_tensor(candidate_x, dtype=tf.float64)
 
+            prior_data_mean = tf.convert_to_tensor(self.PriorMean(self.X_data), dtype=tf.float64)
+
             # Normalize y_data (on the same device)
             y_min, y_max = tf.reduce_min(self.y_data), tf.reduce_max(self.y_data)
 
@@ -418,12 +421,14 @@ class BO:
                 # Select batch
                 candidate_x_batch = candidate_x[i:i + batch_size]
 
+                prior_candidate_mean_batch = self.PriorMean(candidate_x_batch)
+
                 # Compute kernel matrices for the batch
                 K_star = tf.convert_to_tensor(self.Kernel(self.X_data, candidate_x_batch, self.length_scale), dtype=tf.float64)
                 K_star_star = tf.convert_to_tensor(self.Kernel(candidate_x_batch, candidate_x_batch, self.length_scale), dtype=tf.float64)
 
                 # Compute the mean using matrix multiplication (GPU-accelerated)
-                mean_batch = tf.matmul(tf.matmul(K_star, K_inv, transpose_a=True), normalised_y_data)
+                mean_batch = tf.convert_to_tensor(prior_candidate_mean_batch, dtype=tf.float64) + tf.matmul(tf.matmul(K_star, K_inv, transpose_a=True), (normalised_y_data - prior_data_mean))
 
                 # Compute the full covariance matrix of the prediction
                 cov_reduction = tf.matmul(tf.matmul(K_star, K_inv, transpose_a=True), K_star)
@@ -778,6 +783,458 @@ class BO:
         if self.dynamic_bounds is True:
             print(f'The bounds have been reduced {self.bounds_reduction_counter} times.')
 
+
+
+# ==============----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
+                                            
+# ==============----------------- -- -- -- - - Kernels - - -- -- -- -------------------================ #         
+
+
+def RBF_Kernel_GPU(X1, X2, length_scales, batch_size=50000):
+    """
+    Compute the ARD RBF kernel matrix between two sets of vectors X1 and X2 in batches using TensorFlow.
+
+    Parameters:
+    - X1: TensorFlow tensor of shape (n_samples_X1, n_features)
+    - X2: TensorFlow tensor of shape (n_samples_X2, n_features)
+    - length_scales: TensorFlow tensor of shape (d, 1) (ARD) or a single float (isotropic).
+    - batch_size: Number of samples to process in each batch.
+
+    Returns:
+    - K_numpy: The RBF kernel matrix as a NumPy array.
+    """
+    # Choose the device (GPU if available, else CPU)
+    device = '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
+
+    with tf.device(device):
+        # Ensure length_scales is an array
+        if np.isscalar(length_scales):  # If a single float is given, assume isotropic case
+            length_scales = np.full(X1.shape[1], length_scales)  # Shape (d,)
+        else:
+            length_scales = np.asarray(length_scales)
+            if length_scales.shape != (X1.shape[1], 1):
+                raise ValueError(f'Length scales must have shape ({X1.shape[1],}), but got {length_scales.shape}.')
+
+        length_scales = tf.convert_to_tensor(length_scales, dtype=tf.float64)
+
+        n_X, d = X1.shape
+        n_Y = X2.shape[0]
+
+        X1_scaled = tf.convert_to_tensor(X1, dtype=tf.float64) / tf.transpose(length_scales)
+        X2_scaled = tf.convert_to_tensor(X2, dtype=tf.float64) / tf.transpose(length_scales)
+
+        # Initialize the kernel matrix
+        K_list = []
+
+        # Process in batches
+        for i in range(0, n_X, batch_size):
+            X1_batch = X1_scaled[i:i+batch_size]  # Shape (batch_size, d)
+
+            # Compute the squared Euclidean distances between X1_batch and X2
+            sq_dists = tf.reduce_sum(tf.square(X1_batch), axis=1, keepdims=True) + \
+                    tf.reduce_sum(tf.square(X2_scaled), axis=1) - \
+                    2 * tf.matmul(X1_batch, X2_scaled, transpose_b=True)
+
+            # Compute the RBF kernel matrix for this batch
+            K_batch = tf.exp(-0.5 * sq_dists)
+
+            # Append the batch kernel matrix to the list
+            K_list.append(K_batch)
+
+        # Concatenate the batches to form the full kernel matrix
+        K_tf = tf.concat(K_list, axis=0)
+
+        # Convert to NumPy
+        K_numpy = K_tf.numpy()
+
+        return K_numpy
+
+
+
+def RBF_Kernel_CPU(X1, X2, length_scales, batch_size=1000):
+    """
+    Compute the ARD RBF kernel matrix between two sets of points in batches (CPU version).
+
+    Parameters:
+    - X1: array-like, shape (n_X, d)
+        The first set of input points (n_X samples, d dimensions).
+    - X2: array-like, shape (n_Y, d)
+        The second set of input points (n_Y samples, d dimensions).
+    - length_scales: float or array-like, shape (d,)
+        The length scale for each dimension (ARD) or a single float for isotropic case.
+    - batch_size: int, default=1000
+        The number of samples to process in each batch.
+
+    Returns:
+    - K: array, shape (n_X, n_Y)
+        The RBF kernel matrix.
+    """
+    # Ensure length_scales is an array
+    if np.isscalar(length_scales):  # If a single float is given, assume isotropic case
+        length_scales = np.full(X1.shape[1], length_scales)  # Shape (d,)
+    else:
+        length_scales = np.asarray(length_scales)
+        if length_scales.shape != (X1.shape[1], 1):
+            raise ValueError(f'Length scales must have shape ({X1.shape[1],}), but got {length_scales.shape}.')
+
+    n_X, d = X1.shape
+    n_Y = X2.shape[0]
+
+    # Initialize the kernel matrix
+    K = np.empty((n_X, n_Y), dtype=np.float64)
+
+    # Process in batches
+    for i in range(0, n_X, batch_size):
+        X1_batch = X1[i:i+batch_size]  # Shape (batch_size, d)
+
+        # Normalize X1_batch and X2 by length_scales
+        X1_scaled = X1_batch / length_scales.T  # Shape (batch_size, d)
+        X2_scaled = X2 / length_scales.T      # Shape (n_Y, d)
+
+        # Compute the squared Euclidean distances between X1_batch and X2
+        distances = cdist(X1_scaled, X2_scaled, metric='sqeuclidean')  # Shape (batch_size, n_Y)
+
+        # Apply the RBF kernel function
+        K[i:i+batch_size, :] = np.exp(-0.5 * distances)
+
+    return K
+
+
+
+
+def MaternKernel(X1, X2, length_scales, nu=5, batch_size=1000):
+    """
+    Compute the ARD Matern kernel matrix between two sets of points.
+
+    Parameters:
+    - X1: np.ndarray, shape (n_X, d)
+        The first set of input points (n_X samples, d dimensions).
+    - X2: np.ndarray, shape (n_Y, d)
+        The second set of input points (n_Y samples, d dimensions).
+    - length_scales: float or array-like, shape (d,)
+        The length scale for each dimension (ARD) or a single float for isotropic case.
+    - nu: float, optional (default=1.5)
+        Controls the smoothness of the function. Common values: 0.5, 1.5, 2.5.
+
+    Returns:
+    - K: np.ndarray, shape (n_X, n_Y)
+        The Matern kernel matrix.
+    """
+
+    from scipy.special import kv, gamma
+
+    # Ensure length_scales is an array
+    if np.isscalar(length_scales):  # If a single float is given, assume isotropic case
+        length_scales = np.full(X1.shape[1], length_scales)  # Shape (d,)
+    else:
+        length_scales = np.asarray(length_scales)
+        if length_scales.shape != (X1.shape[1], 1):
+            raise ValueError(f'Length scales must have shape ({X1.shape[1],}), but got {length_scales.shape}.')
+
+    n_X, d = X1.shape
+    n_Y = X2.shape[0]
+
+    # Initialize the kernel matrix
+    K = np.empty((n_X, n_Y), dtype=np.float64)
+
+    # Process in batches
+    for i in range(0, n_X, batch_size):
+        X1_batch = X1[i:i+batch_size]  # Shape (batch_size, d)
+
+        # Normalize X1_batch and X2 by length_scales
+        X1_scaled = X1_batch / length_scales.T  # Shape (batch_size, d)
+        X2_scaled = X2 / length_scales.T      # Shape (n_Y, d)
+
+        # Compute the squared Euclidean distances between X1_batch and X2
+        distances = cdist(X1_scaled, X2_scaled, metric='sqeuclidean')  # Shape (batch_size, n_Y)
+
+        # Compute scaled distances
+        scaled_dists = np.sqrt(2 * nu) * distances  # Shape (n_X, n_Y)
+
+        # Compute Matern kernel based on nu value
+        if nu == 0.5:
+            K[i:i+batch_size, :] = np.exp(-scaled_dists)  # Matern 0.5 (Exponential kernel)
+        else:
+            # Compute the Matern function
+            K[i:i+batch_size, :] = (2 ** (1.0 - nu) / gamma(nu)) * (scaled_dists ** nu) * kv(nu, scaled_dists)
+
+            # Ensure numerical stability: Handle NaN values
+            K[i:i+batch_size, :][distances == 0] = 1.0  # K(x, x) = 1 for all nu
+
+    return K
+
+
+
+# ==============----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
+                                            
+# ==============----------------- -- - - Kernel Optimisation - - -- -------------------================ #   
+
+
+def log_marginal_likelihood(X_data, Y_data, kernel_function, *kernel_params):
+    """
+    Compute the log marginal likelihood (LML) for a given kernel function. Usful in predicting kernel hyper-parameters such as lengthscale. 
+    Whichever set of hyper-parameters maximise the LML define the kernel which best predicts the observed data. 
+
+    Parameters:
+    - X_data: Input data points (N x d)
+    - Y_data: Observed values (N x 1)
+    - kernel_function: A function that computes the covariance matrix K(X, X)
+    - *kernel_params: Parameters for the kernel function (e.g., length scale, variance, etc.)
+
+    Returns:
+    - log marginal likelihood (scalar)
+    """
+    # Compute the kernel matrix with the provided kernel function
+    K = kernel_function(X_data, X_data, *kernel_params) + 1e-5 * np.eye(len(X_data))
+
+    # Cholesky decomposition for numerical stability
+    L = np.linalg.cholesky(K)
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, Y_data))  # Equivalent to K_inv @ Y_data
+
+    # Log determinant using Cholesky
+    log_det_K = 2 * np.sum(np.log(np.diag(L)))
+
+    # Compute log marginal likelihood
+    n = len(Y_data)
+    term1 = Y_data.T @ alpha
+    term2 = log_det_K
+    log_likelihood = -0.5 * term1 - 0.5 * term2 - 0.5 * n * np.log(2 * np.pi)
+
+    return log_likelihood
+
+
+
+# ==========p====----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
+                                            
+# ==============----------------- -- -- Acquisition Functions - -- -------------------================ #    
+
+def UpperConfidenceBound(mean, standard_deviation, kappa=0.1):
+    """
+    Compute the acquisition value for a given set of parameters using the Upper Confidence Bound (UCB) method.
+
+    The UCB method combines the predicted mean and standard deviation with a kappa value to balance 
+    exploration and exploitation in selecting the next point to sample.
+
+    Parameters
+    ----------
+    mean : np.ndarray
+        The predicted mean values of the objective function.
+    standard_deviation : np.ndarray
+        The predicted standard deviation (uncertainty) of the prediction.
+    kappa : float, optional
+        A parameter that controls the trade-off between exploration and exploitation.
+
+    Returns
+    -------
+    np.ndarray
+        The acquisition values used to guide the selection of the next sample point.
+    """
+    # Generate a small random noise to avoid deterministic behavior
+    random_numbers = 0.05 * (np.random.rand(len(mean)).reshape(len(mean), 1))
+    random_numbers = random_numbers * np.max(standard_deviation)
+
+    # Compute the UCB acquisition function
+    ucb = mean + kappa * (standard_deviation + random_numbers)
+
+    return ucb
+
+def ExpectedImprovement(mean, standard_deviation, best_observed=1.0, kappa=0.01):
+    """
+    Compute the Expected Improvement (EI) acquisition function value for a given set of parameters.
+
+    The EI method calculates the expected improvement over the current best observed value, encouraging
+    sampling in regions with high uncertainty or potential improvements.
+
+    Parameters
+    ----------
+    mean : np.ndarray
+        The predicted mean values of the objective function.
+    standard_deviation : np.ndarray
+        The predicted standard deviation (uncertainty) of the prediction.
+    best_observed : float, optional
+        The current best observed value of the objective function.
+    kappa : float, optional
+        Exploration parameter, a small positive value to encourage exploration.
+
+    Returns
+    -------
+    np.ndarray
+        The expected improvement values for each point in the input.
+    """
+    # Calculate the improvement (mean - best_observed - kappa)
+    improvement = mean - best_observed - kappa
+    
+    # Calculate the Z value for standardization
+    Z = improvement / (standard_deviation + 1e-9)  # Adding epsilon to avoid division by zero
+    
+    # Calculate the Expected Improvement
+    ei = improvement * norm.cdf(Z) + standard_deviation * norm.pdf(Z)
+    
+    # Ensure non-negative EI values
+    for i in range(len(ei)):
+        ei[i] = np.max(ei[i], 0)
+
+    return ei
+
+def ProbabilityImprovement(mean, standard_deviation, best_observed=1.0, kappa=0.01):
+    """
+    Compute the Probability of Improvement (PI) acquisition function value for a given set of parameters.
+
+    The PI method calculates the probability that the objective function will improve upon the current best 
+    observed value, balancing exploration and exploitation.
+
+    Parameters
+    ----------
+    mean : np.ndarray
+        The predicted mean values of the objective function.
+    standard_deviation : np.ndarray
+        The predicted standard deviation (uncertainty) of the prediction.
+    best_observed : float, optional
+        The current best observed value of the objective function.
+    kappa : float, optional
+        Exploration parameter, a small positive value to encourage exploration.
+
+    Returns
+    -------
+    np.ndarray
+        The probability of improvement values for each point in the input.
+    """
+    # Calculate the improvement (mean - best_observed - kappa)
+    improvement = mean - best_observed - kappa
+    
+    # Calculate the Z value for standardization
+    Z = improvement / (standard_deviation + 1e-9)  # Adding epsilon to avoid division by zero
+    
+    # Calculate the Probability of Improvement
+    pi = norm.cdf(Z)
+
+    return pi
+
+def KnowledgeGradient(mean, standard_deviation, best_observed=1.0, kappa=0.01):
+    """
+    Compute the Knowledge Gradient (KG) acquisition function value for a given set of parameters.
+
+    The KG method calculates the expected increase in the value of the best solution found so far by sampling 
+    a new point, normalizing the expected improvement by the standard deviation.
+
+    Parameters
+    ----------
+    mean : np.ndarray
+        The predicted mean values of the objective function.
+    standard_deviation : np.ndarray
+        The predicted standard deviation (uncertainty) of the prediction.
+    best_observed : float, optional
+        The current best observed value of the objective function.
+    kappa : float, optional
+        Exploration parameter, a small positive value to encourage exploration.
+
+    Returns
+    -------
+    np.ndarray
+        The knowledge gradient values for each point in the input.
+    """
+    # Calculate the improvement (mean - best_observed - kappa)
+    improvement = mean - best_observed - kappa
+
+    # Calculate the Z value for standardization
+    Z = improvement / (standard_deviation + 1e-9)  # Adding epsilon to avoid division by zero
+
+    # Calculate the Expected Improvement for the next step
+    ei = improvement * norm.cdf(Z) + standard_deviation * norm.pdf(Z)
+
+    # Compute the Knowledge Gradient
+    kg = ei / (standard_deviation + 1e-9)
+
+    return kg
+
+def BayesianExpectedLoss(mean, standard_deviation, best_observed=1.0, kappa=0.01):
+    """
+    Compute the Bayesian Expected Loss (BEL) acquisition function value for a given set of parameters.
+
+    The BEL method calculates the expected loss associated with selecting a point that is not the true 
+    optimum, considering the uncertainty of the predictions.
+
+    Parameters
+    ----------
+    mean : np.ndarray
+        The predicted mean values of the objective function.
+    standard_deviation : np.ndarray
+        The predicted standard deviation (uncertainty) of the prediction.
+    best_observed : float, optional
+        The current best observed value of the objective function.
+    kappa : float, optional
+        Exploration parameter, a small positive value to encourage exploration.
+
+    Returns
+    -------
+    np.ndarray
+        The BEL values for each point in the input.
+    """
+    # Calculate the improvement (mean - best_observed - kappa)
+    improvement = mean - best_observed - kappa
+    
+    # Calculate the Z value for standardization
+    Z = improvement / (standard_deviation + 1e-9)  # Adding epsilon to avoid division by zero
+    
+    # Calculate the loss: expected loss is proportional to the distance from the best observed
+    loss = norm.pdf(Z) * standard_deviation + (Z * norm.cdf(Z)) * standard_deviation
+    
+    # Calculate the Bayesian Expected Loss
+    bel = loss
+    
+    return bel
+
+# ==============----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
+                                            
+# ==============----------------- -- -- - Load/Save Object - -- -- -------------------================ #    
+
+def SaveOptimiser(object, file_path):
+    """
+    Save the Bayesian Optimization object to a file using pickle.
+
+    This function serialises the given Bayesian Optimization object and saves it to 
+    a specified file path. This allows for the persistence of the optimiser's state,
+    enabling it to be loaded and used later.
+
+    Parameters
+    ----------
+    object : BO
+        The Bayesian Optimization object to be saved.
+    file_path : str
+        The file path where the object should be saved.
+    """
+    # Open the specified file in write-binary mode
+    with open(file_path, 'wb') as file:
+        # Serialise the object using pickle and write it to the file
+        pickle.dump(object, file)
+
+def LoadOptimiser(file_path):
+    """
+    Load a Bayesian Optimization object from a file using pickle.
+
+    This function deserialises a Bayesian Optimization object from a specified file path,
+    allowing for the continuation of a previously saved optimization process.
+
+    Parameters
+    ----------
+    file_path : str
+        The file path from where the object should be loaded.
+
+    Returns
+    -------
+    BO
+        The loaded Bayesian Optimization object.
+    """
+    # Open the specified file in read-binary mode
+    with open(file_path, 'rb') as file:
+        # Deserialise the object using pickle and return it
+        object = pickle.load(file)
+
+    return object
+
+
+
+
 # ==============----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
                                             
 # ==============----------------- -- -- - - - Plotting - - - -- -- -------------------================ #   
@@ -1037,410 +1494,3 @@ def PlotParameterCorrelation(object):
     fig.colorbar(scatter, ax=ax.ravel().tolist(), label='Y value')
 
     plt.show()
-
-# ==============----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
-                                            
-# ==============----------------- -- -- -- - - Kernels - - -- -- -- -------------------================ #         
-
-
-def RBF_Kernel_GPU(X1, X2, length_scales, batch_size=50000):
-    """
-    Compute the ARD RBF kernel matrix between two sets of vectors X1 and X2 in batches using TensorFlow.
-
-    Parameters:
-    - X1: TensorFlow tensor of shape (n_samples_X1, n_features)
-    - X2: TensorFlow tensor of shape (n_samples_X2, n_features)
-    - length_scales: TensorFlow tensor of shape (d, 1) (ARD) or a single float (isotropic).
-    - batch_size: Number of samples to process in each batch.
-
-    Returns:
-    - K_numpy: The RBF kernel matrix as a NumPy array.
-    """
-    # Choose the device (GPU if available, else CPU)
-    device = '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
-
-    with tf.device(device):
-        # Ensure length_scales is an array
-        if np.isscalar(length_scales):  # If a single float is given, assume isotropic case
-            length_scales = np.full(X1.shape[1], length_scales)  # Shape (d,)
-        else:
-            length_scales = np.asarray(length_scales)
-            if length_scales.shape != (X1.shape[1], 1):
-                raise ValueError(f'Length scales must have shape ({X1.shape[1],}), but got {length_scales.shape}.')
-
-        length_scales = tf.convert_to_tensor(length_scales, dtype=tf.float64)
-
-        n_X, d = X1.shape
-        n_Y = X2.shape[0]
-
-        X1_scaled = tf.convert_to_tensor(X1, dtype=tf.float64) / tf.transpose(length_scales)
-        X2_scaled = tf.convert_to_tensor(X2, dtype=tf.float64) / tf.transpose(length_scales)
-
-        # Initialize the kernel matrix
-        K_list = []
-
-        # Process in batches
-        for i in range(0, n_X, batch_size):
-            X1_batch = X1_scaled[i:i+batch_size]  # Shape (batch_size, d)
-
-            # Compute the squared Euclidean distances between X1_batch and X2
-            sq_dists = tf.reduce_sum(tf.square(X1_batch), axis=1, keepdims=True) + \
-                    tf.reduce_sum(tf.square(X2_scaled), axis=1) - \
-                    2 * tf.matmul(X1_batch, X2_scaled, transpose_b=True)
-
-            # Compute the RBF kernel matrix for this batch
-            K_batch = tf.exp(-0.5 * sq_dists)
-
-            # Append the batch kernel matrix to the list
-            K_list.append(K_batch)
-
-        # Concatenate the batches to form the full kernel matrix
-        K_tf = tf.concat(K_list, axis=0)
-
-        # Convert to NumPy
-        K_numpy = K_tf.numpy()
-
-        return K_numpy
-
-
-
-def RBF_Kernel_CPU(X1, X2, length_scales, batch_size=1000):
-    """
-    Compute the ARD RBF kernel matrix between two sets of points in batches (CPU version).
-
-    Parameters:
-    - X1: array-like, shape (n_X, d)
-        The first set of input points (n_X samples, d dimensions).
-    - X2: array-like, shape (n_Y, d)
-        The second set of input points (n_Y samples, d dimensions).
-    - length_scales: float or array-like, shape (d,)
-        The length scale for each dimension (ARD) or a single float for isotropic case.
-    - batch_size: int, default=1000
-        The number of samples to process in each batch.
-
-    Returns:
-    - K: array, shape (n_X, n_Y)
-        The RBF kernel matrix.
-    """
-    # Ensure length_scales is an array
-    if np.isscalar(length_scales):  # If a single float is given, assume isotropic case
-        length_scales = np.full(X1.shape[1], length_scales)  # Shape (d,)
-    else:
-        length_scales = np.asarray(length_scales)
-        if length_scales.shape != (X1.shape[1], 1):
-            raise ValueError(f'Length scales must have shape ({X1.shape[1],}), but got {length_scales.shape}.')
-
-    n_X, d = X1.shape
-    n_Y = X2.shape[0]
-
-    # Initialize the kernel matrix
-    K = np.empty((n_X, n_Y), dtype=np.float64)
-
-    # Process in batches
-    for i in range(0, n_X, batch_size):
-        X1_batch = X1[i:i+batch_size]  # Shape (batch_size, d)
-
-        # Normalize X1_batch and X2 by length_scales
-        X1_scaled = X1_batch / length_scales.T  # Shape (batch_size, d)
-        X2_scaled = X2 / length_scales.T      # Shape (n_Y, d)
-
-        # Compute the squared Euclidean distances between X1_batch and X2
-        distances = cdist(X1_scaled, X2_scaled, metric='sqeuclidean')  # Shape (batch_size, n_Y)
-
-        # Apply the RBF kernel function
-        K[i:i+batch_size, :] = np.exp(-0.5 * distances)
-
-    return K
-
-
-
-
-def MaternKernel(X1, X2, length_scales, nu=5, batch_size=1000):
-    """
-    Compute the ARD Matern kernel matrix between two sets of points.
-
-    Parameters:
-    - X1: np.ndarray, shape (n_X, d)
-        The first set of input points (n_X samples, d dimensions).
-    - X2: np.ndarray, shape (n_Y, d)
-        The second set of input points (n_Y samples, d dimensions).
-    - length_scales: float or array-like, shape (d,)
-        The length scale for each dimension (ARD) or a single float for isotropic case.
-    - nu: float, optional (default=1.5)
-        Controls the smoothness of the function. Common values: 0.5, 1.5, 2.5.
-
-    Returns:
-    - K: np.ndarray, shape (n_X, n_Y)
-        The Matern kernel matrix.
-    """
-
-    from scipy.special import kv, gamma
-
-    # Ensure length_scales is an array
-    if np.isscalar(length_scales):  # If a single float is given, assume isotropic case
-        length_scales = np.full(X1.shape[1], length_scales)  # Shape (d,)
-    else:
-        length_scales = np.asarray(length_scales)
-        if length_scales.shape != (X1.shape[1], 1):
-            raise ValueError(f'Length scales must have shape ({X1.shape[1],}), but got {length_scales.shape}.')
-
-    n_X, d = X1.shape
-    n_Y = X2.shape[0]
-
-    # Initialize the kernel matrix
-    K = np.empty((n_X, n_Y), dtype=np.float64)
-
-    # Process in batches
-    for i in range(0, n_X, batch_size):
-        X1_batch = X1[i:i+batch_size]  # Shape (batch_size, d)
-
-        # Normalize X1_batch and X2 by length_scales
-        X1_scaled = X1_batch / length_scales.T  # Shape (batch_size, d)
-        X2_scaled = X2 / length_scales.T      # Shape (n_Y, d)
-
-        # Compute the squared Euclidean distances between X1_batch and X2
-        distances = cdist(X1_scaled, X2_scaled, metric='sqeuclidean')  # Shape (batch_size, n_Y)
-
-        # Compute scaled distances
-        scaled_dists = np.sqrt(2 * nu) * distances  # Shape (n_X, n_Y)
-
-        # Compute Matern kernel based on nu value
-        if nu == 0.5:
-            K[i:i+batch_size, :] = np.exp(-scaled_dists)  # Matern 0.5 (Exponential kernel)
-        else:
-            # Compute the Matern function
-            K[i:i+batch_size, :] = (2 ** (1.0 - nu) / gamma(nu)) * (scaled_dists ** nu) * kv(nu, scaled_dists)
-
-            # Ensure numerical stability: Handle NaN values
-            K[i:i+batch_size, :][distances == 0] = 1.0  # K(x, x) = 1 for all nu
-
-    return K
-
-
-# ==========p====----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
-                                            
-# ==============----------------- -- -- Acquisition Functions - -- -------------------================ #    
-
-def UpperConfidenceBound(mean, standard_deviation, kappa=0.1):
-    """
-    Compute the acquisition value for a given set of parameters using the Upper Confidence Bound (UCB) method.
-
-    The UCB method combines the predicted mean and standard deviation with a kappa value to balance 
-    exploration and exploitation in selecting the next point to sample.
-
-    Parameters
-    ----------
-    mean : np.ndarray
-        The predicted mean values of the objective function.
-    standard_deviation : np.ndarray
-        The predicted standard deviation (uncertainty) of the prediction.
-    kappa : float, optional
-        A parameter that controls the trade-off between exploration and exploitation.
-
-    Returns
-    -------
-    np.ndarray
-        The acquisition values used to guide the selection of the next sample point.
-    """
-    # Generate a small random noise to avoid deterministic behavior
-    random_numbers = 0.05 * (np.random.rand(len(mean)).reshape(len(mean), 1))
-    random_numbers = random_numbers * np.max(standard_deviation)
-
-    # Compute the UCB acquisition function
-    ucb = mean + kappa * (standard_deviation + random_numbers)
-
-    return ucb
-
-def ExpectedImprovement(mean, standard_deviation, best_observed=1.0, kappa=0.01):
-    """
-    Compute the Expected Improvement (EI) acquisition function value for a given set of parameters.
-
-    The EI method calculates the expected improvement over the current best observed value, encouraging
-    sampling in regions with high uncertainty or potential improvements.
-
-    Parameters
-    ----------
-    mean : np.ndarray
-        The predicted mean values of the objective function.
-    standard_deviation : np.ndarray
-        The predicted standard deviation (uncertainty) of the prediction.
-    best_observed : float, optional
-        The current best observed value of the objective function.
-    kappa : float, optional
-        Exploration parameter, a small positive value to encourage exploration.
-
-    Returns
-    -------
-    np.ndarray
-        The expected improvement values for each point in the input.
-    """
-    # Calculate the improvement (mean - best_observed - kappa)
-    improvement = mean - best_observed - kappa
-    
-    # Calculate the Z value for standardization
-    Z = improvement / (standard_deviation + 1e-9)  # Adding epsilon to avoid division by zero
-    
-    # Calculate the Expected Improvement
-    ei = improvement * norm.cdf(Z) + standard_deviation * norm.pdf(Z)
-    
-    # Ensure non-negative EI values
-    for i in range(len(ei)):
-        ei[i] = np.max(ei[i], 0)
-
-    return ei
-
-def ProbabilityImprovement(mean, standard_deviation, best_observed=1.0, kappa=0.01):
-    """
-    Compute the Probability of Improvement (PI) acquisition function value for a given set of parameters.
-
-    The PI method calculates the probability that the objective function will improve upon the current best 
-    observed value, balancing exploration and exploitation.
-
-    Parameters
-    ----------
-    mean : np.ndarray
-        The predicted mean values of the objective function.
-    standard_deviation : np.ndarray
-        The predicted standard deviation (uncertainty) of the prediction.
-    best_observed : float, optional
-        The current best observed value of the objective function.
-    kappa : float, optional
-        Exploration parameter, a small positive value to encourage exploration.
-
-    Returns
-    -------
-    np.ndarray
-        The probability of improvement values for each point in the input.
-    """
-    # Calculate the improvement (mean - best_observed - kappa)
-    improvement = mean - best_observed - kappa
-    
-    # Calculate the Z value for standardization
-    Z = improvement / (standard_deviation + 1e-9)  # Adding epsilon to avoid division by zero
-    
-    # Calculate the Probability of Improvement
-    pi = norm.cdf(Z)
-
-    return pi
-
-def KnowledgeGradient(mean, standard_deviation, best_observed=1.0, kappa=0.01):
-    """
-    Compute the Knowledge Gradient (KG) acquisition function value for a given set of parameters.
-
-    The KG method calculates the expected increase in the value of the best solution found so far by sampling 
-    a new point, normalizing the expected improvement by the standard deviation.
-
-    Parameters
-    ----------
-    mean : np.ndarray
-        The predicted mean values of the objective function.
-    standard_deviation : np.ndarray
-        The predicted standard deviation (uncertainty) of the prediction.
-    best_observed : float, optional
-        The current best observed value of the objective function.
-    kappa : float, optional
-        Exploration parameter, a small positive value to encourage exploration.
-
-    Returns
-    -------
-    np.ndarray
-        The knowledge gradient values for each point in the input.
-    """
-    # Calculate the improvement (mean - best_observed - kappa)
-    improvement = mean - best_observed - kappa
-
-    # Calculate the Z value for standardization
-    Z = improvement / (standard_deviation + 1e-9)  # Adding epsilon to avoid division by zero
-
-    # Calculate the Expected Improvement for the next step
-    ei = improvement * norm.cdf(Z) + standard_deviation * norm.pdf(Z)
-
-    # Compute the Knowledge Gradient
-    kg = ei / (standard_deviation + 1e-9)
-
-    return kg
-
-def BayesianExpectedLoss(mean, standard_deviation, best_observed=1.0, kappa=0.01):
-    """
-    Compute the Bayesian Expected Loss (BEL) acquisition function value for a given set of parameters.
-
-    The BEL method calculates the expected loss associated with selecting a point that is not the true 
-    optimum, considering the uncertainty of the predictions.
-
-    Parameters
-    ----------
-    mean : np.ndarray
-        The predicted mean values of the objective function.
-    standard_deviation : np.ndarray
-        The predicted standard deviation (uncertainty) of the prediction.
-    best_observed : float, optional
-        The current best observed value of the objective function.
-    kappa : float, optional
-        Exploration parameter, a small positive value to encourage exploration.
-
-    Returns
-    -------
-    np.ndarray
-        The BEL values for each point in the input.
-    """
-    # Calculate the improvement (mean - best_observed - kappa)
-    improvement = mean - best_observed - kappa
-    
-    # Calculate the Z value for standardization
-    Z = improvement / (standard_deviation + 1e-9)  # Adding epsilon to avoid division by zero
-    
-    # Calculate the loss: expected loss is proportional to the distance from the best observed
-    loss = norm.pdf(Z) * standard_deviation + (Z * norm.cdf(Z)) * standard_deviation
-    
-    # Calculate the Bayesian Expected Loss
-    bel = loss
-    
-    return bel
-
-# ==============----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
-                                            
-# ==============----------------- -- -- - Load/Save Object - -- -- -------------------================ #    
-
-def SaveOptimiser(object, file_path):
-    """
-    Save the Bayesian Optimization object to a file using pickle.
-
-    This function serialises the given Bayesian Optimization object and saves it to 
-    a specified file path. This allows for the persistence of the optimiser's state,
-    enabling it to be loaded and used later.
-
-    Parameters
-    ----------
-    object : BO
-        The Bayesian Optimization object to be saved.
-    file_path : str
-        The file path where the object should be saved.
-    """
-    # Open the specified file in write-binary mode
-    with open(file_path, 'wb') as file:
-        # Serialise the object using pickle and write it to the file
-        pickle.dump(object, file)
-
-def LoadOptimiser(file_path):
-    """
-    Load a Bayesian Optimization object from a file using pickle.
-
-    This function deserialises a Bayesian Optimization object from a specified file path,
-    allowing for the continuation of a previously saved optimization process.
-
-    Parameters
-    ----------
-    file_path : str
-        The file path from where the object should be loaded.
-
-    Returns
-    -------
-    BO
-        The loaded Bayesian Optimization object.
-    """
-    # Open the specified file in read-binary mode
-    with open(file_path, 'rb') as file:
-        # Deserialise the object using pickle and return it
-        object = pickle.load(file)
-
-    return object
