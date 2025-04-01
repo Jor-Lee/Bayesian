@@ -46,12 +46,13 @@ class BO:
         Factor by which to reduce bounds. Used only if dynamic_bounds is True.
     """
 
-    def __init__(self, PriorMeanFunction, KernelFunction, length_scale, bounds, AcquisitionFunction, acquisition_samples, random_seed=None, minimise=False, log_path=None, dynamic_bounds=False, iterations_between_reducing_bounds=None, first_reduce_bounds=None, reduce_bounds_factor=None):
+    def __init__(self, PriorMeanFunction, KernelFunction, length_scale, bounds, AcquisitionFunction, acquisition_samples, noise=1e-5, random_seed=None, minimise=False, log_path=None, dynamic_bounds=False, iterations_between_reducing_bounds=None, first_reduce_bounds=None, reduce_bounds_factor=None):
         # initialise class attributes with provided parameters.
         self.PriorMean = PriorMeanFunction
         self.Kernel = KernelFunction
         self.length_scale = length_scale
         self.bounds = bounds
+        self.noise = max(noise, 1e-5)
         
         self.AcquisitionFunction = AcquisitionFunction
         self.acquisition_samples = acquisition_samples
@@ -151,7 +152,6 @@ class BO:
                 K_inv = self.InverseKernel()
 
             # Generate a set of 'acquisition_samples' candidate points from random samples within the bounds
-            # Compute the kernel matrix with the jitter term added
             candidate_x = np.random.uniform(self.bounds[:, 0], self.bounds[:, 1], size=(self.acquisition_samples, self.bounds.shape[0]))
 
             # Predict the mean and standard deviation at each of these points
@@ -330,25 +330,19 @@ class BO:
 
     # ==============----------------- -- -- -- - - Algebra - - -- -- -- -------------------================ #
 
-    def InverseKernel(self, jitter=1e-6):
+    def InverseKernel(self):
         """
         Calculate the inverse of the kernel matrix (K_inv) using Cholesky decomposition.
 
-        This method adds a small jitter term to the kernel matrix for numerical stability,
-        performs Cholesky decomposition, and computes the inverse efficiently.
-
-        Parameters
-        ----------
-        jitter : float, optional
-            A small value added to the diagonal of the kernel matrix to improve numerical stability.
+        This method adds Gaussian noise to the model.
 
         Returns
         -------
         K_inv : ndarray, shape (n_samples, n_samples)
             The inverse of the kernel matrix.
         """
-        # Compute the kernel matrix with the jitter term added
-        K = self.Kernel(self.X_data, self.X_data, self.length_scale) + jitter * np.eye(len(self.X_data))
+        # Compute the kernel matrix with the Gaussian noise
+        K = self.Kernel(self.X_data, self.X_data, self.length_scale) + self.noise * np.eye(len(self.X_data))
 
         # Cholesky decomposition: K = L L^T
         try:
@@ -368,7 +362,7 @@ class BO:
 
 
 
-    def PredictMeanVariance(self, candidate_x, K_inv=None, jitter=1e-7, normalised=True, batch_size=1000):
+    def PredictMeanVariance(self, candidate_x, K_inv=None, normalised=True, batch_size=1000):
         """
         Predict the mean and variance using GPU-accelerated matrix operations with TensorFlow.
         Processes candidate_x in batches.
@@ -376,7 +370,6 @@ class BO:
         Parameters:
         - candidate_x: NumPy array of shape (n_candidates, d)
         - K_inv: (n_train, n_train) NumPy array, inverse kernel matrix (precomputed)
-        - jitter: Small value added for numerical stability
         - normalised: If True, returns normalised values
         - batch_size: Batch size for kernel computations
 
@@ -970,7 +963,7 @@ def MaternKernel(X1, X2, length_scales, nu=5, batch_size=1000):
 # ==============----------------- -- - - Kernel Optimisation - - -- -------------------================ #   
 
 
-def log_marginal_likelihood(X_data, Y_data, kernel_function, *kernel_params):
+def LogMarginalLikelihood(X_data, Y_data, kernel_function, noise, *kernel_params):
     """
     Compute the log marginal likelihood (LML) for a given kernel function. Usful in predicting kernel hyper-parameters such as lengthscale. 
     Whichever set of hyper-parameters maximise the LML define the kernel which best predicts the observed data. 
@@ -985,7 +978,7 @@ def log_marginal_likelihood(X_data, Y_data, kernel_function, *kernel_params):
     - log marginal likelihood (scalar)
     """
     # Compute the kernel matrix with the provided kernel function
-    K = kernel_function(X_data, X_data, *kernel_params) + 1e-5 * np.eye(len(X_data))
+    K = kernel_function(X_data, X_data, *kernel_params) + noise * np.eye(len(X_data))
 
     # Cholesky decomposition for numerical stability
     L = np.linalg.cholesky(K)
@@ -1000,8 +993,30 @@ def log_marginal_likelihood(X_data, Y_data, kernel_function, *kernel_params):
     term2 = log_det_K
     log_likelihood = -0.5 * term1 - 0.5 * term2 - 0.5 * n * np.log(2 * np.pi)
 
-    return log_likelihood
+    return log_likelihood[0][0]
 
+
+def OptimiseLML(Kernel, X_data, Y_data, noise, initial_params):
+    from scipy.optimize import minimize
+
+    def objective(log_params):
+        params = np.exp(log_params)
+        params = np.array(params.reshape(-1, 1)) # Reshape lengthscale params. Will be trickier to generalise this, but will be fine for now.
+        return - LogMarginalLikelihood(X_data, Y_data, Kernel, noise, params)
+
+    initial_log_params = np.log(initial_params.flatten())
+    result = minimize(objective, initial_log_params, method='L-BFGS-B')
+
+    optimal_params = np.exp(result.x)
+
+    # Print results
+    print("Optimal parameters:", optimal_params)
+    print("Function value at optimum:", result.fun)
+    print("Converged:", result.success)
+    print("Number of iterations:", result.nit)
+    print("Number of function evaluations:", result.nfev)
+
+    return optimal_params
 
 
 # ==========p====----------------- -- -- -- - - - - - - -- -- -- -- -------------------================ #
