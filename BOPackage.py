@@ -996,13 +996,40 @@ def LogMarginalLikelihood(X_data, Y_data, kernel_function, noise, *kernel_params
     return log_likelihood[0][0]
 
 
-def OptimiseLML(Kernel, X_data, Y_data, noise, initial_params):
+def LengthScalePenalty(length_scales, lambda_penalty=1.0):
+    """
+    Penalize large disparities between length scales.
+    
+    Parameters:
+    - kernel_params: List of kernel parameters, including length scales
+    - lambda_penalty: The strength of the penalty on disparities between length scales
+    
+    Returns:
+    - The regularization penalty term
+    """
+    penalty = 0.0
+    # Sum of squared differences between length scales
+    for i in range(len(length_scales)):
+        for j in range(i+1, len(length_scales)):
+            penalty += (length_scales[i] - length_scales[j])**2
+
+    return lambda_penalty * penalty
+
+
+def OptimiseLML(Kernel, X_data, Y_data, noise, initial_params, lambda_penalty=1.0):
     from scipy.optimize import minimize
 
     def objective(log_params):
-        params = np.exp(log_params)
-        params = np.array(params.reshape(-1, 1)) # Reshape lengthscale params. Will be trickier to generalise this, but will be fine for now.
-        return - LogMarginalLikelihood(X_data, Y_data, Kernel, noise, params)
+        params = np.exp(log_params)  # Exponentiate to transform back from log scale
+        
+        # Regularization penalty to encourage balanced length scales
+        penalty = LengthScalePenalty(params, lambda_penalty)
+        
+        # Compute the log marginal likelihood
+        log_likelihood = -LogMarginalLikelihood(X_data, Y_data, Kernel, noise, params.reshape(-1, 1))
+        
+        # Add the length scale penalty to the objective function
+        return log_likelihood + penalty
 
     initial_log_params = np.log(initial_params.flatten())
     result = minimize(objective, initial_log_params, method='L-BFGS-B')
